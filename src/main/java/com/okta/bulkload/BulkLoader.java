@@ -6,6 +6,9 @@ import java.io.*;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.security.SecureRandom;
+import java.security.MessageDigest;
+import java.util.*;
 
 import org.apache.commons.csv.*;
 import org.apache.commons.lang.RandomStringUtils;
@@ -19,6 +22,13 @@ import org.apache.http.impl.client.DefaultHttpRequestRetryHandler;
 import org.apache.http.impl.client.HttpClientBuilder;
 import org.apache.http.util.EntityUtils;
 import org.json.*;
+
+import com.fasterxml.uuid.Generators;
+import com.fasterxml.uuid.UUIDGenerator;
+import com.fasterxml.uuid.UUIDType;
+import com.fasterxml.uuid.impl.UUIDUtil;
+import com.fasterxml.uuid.impl.RandomBasedGenerator;
+
 /**
  *
  * @author schandra
@@ -27,10 +37,12 @@ import org.json.*;
 public class BulkLoader {
     final static Properties configuration = new Properties();
     protected static AtomicInteger successCount = new AtomicInteger(0), errorCount = new AtomicInteger(0);
-    protected static CSVPrinter errorRecordPrinter, rateLimitFailurePrinter;
+    protected static CSVPrinter errorRecordPrinter, rateLimitFailurePrinter, successRecordPrinter;
     protected static volatile boolean noMoreRecordsBeingAdded = false;
     protected static volatile boolean errorHeaderWritten = false;
+    protected static volatile boolean successHeaderWritten = false;
     protected static String[] errorHeaders = null;
+    protected static String[] successHeaders = null;
     protected static String csvFileArg = null;
 
     public static void main(String args[]) throws Exception{
@@ -56,14 +68,19 @@ public class BulkLoader {
         String filePrefix = csvFileArg.substring(0,csvFileArg.lastIndexOf('.'));	
         String errorFile = filePrefix+"_reject.csv";
         String rateLimitFile = filePrefix+"_replay.csv";
+        String successFile = filePrefix+"_success.csv";
         errorHeaders = (configuration.getProperty("csvHeaderRow")+",errorCode,errorCause").split(",");
+        successHeaders = (configuration.getProperty("csvHeaderRow")+",subjectId,oktaId").split(",");
         int numConsumers = Integer.parseInt(configuration.getProperty("numConsumers", "1"));
         int bufferSize = Integer.parseInt(configuration.getProperty("bufferSize", "10000"));
         
         CSVFormat errorFormat = CSVFormat.RFC4180.withDelimiter(',').withQuote('"').withQuoteMode(QuoteMode.ALL).withHeader(errorHeaders);        
+        CSVFormat successFormat = CSVFormat.RFC4180.withDelimiter(',').withQuote('"').withQuoteMode(QuoteMode.ALL).withHeader(successHeaders);        
         errorRecordPrinter = new CSVPrinter(new FileWriter(errorFile),errorFormat);
+        successRecordPrinter = new CSVPrinter(new FileWriter(successFile),successFormat);
         rateLimitFailurePrinter = new CSVPrinter(new FileWriter(rateLimitFile),errorFormat);
         errorRecordPrinter.flush();
+        successRecordPrinter.flush();
         rateLimitFailurePrinter.flush();
         
         BlockingQueue myQueue = new LinkedBlockingQueue(bufferSize);
@@ -127,7 +144,10 @@ class Producer implements Runnable {
     private final String csvHeaderRow;
     private final String[] csvHeaders;
     private final String csvLoginField;
+    private final String credentialType;
     private final CloseableHttpClient httpclient;
+    private static final SecureRandom secureRandom = new SecureRandom();
+    private static final RandomBasedGenerator uuidGenerator = Generators.randomBasedGenerator(secureRandom);
     Consumer(BlockingQueue q) { 
         queue = q; 
         org = configuration.getProperty("org");
@@ -135,6 +155,7 @@ class Producer implements Runnable {
         csvHeaderRow = configuration.getProperty("csvHeaderRow");
         csvHeaders = csvHeaderRow.split(",");
         csvLoginField = configuration.getProperty("csvLoginField");
+        credentialType = configuration.getProperty("credentialType");
         httpclient = HttpClientBuilder.create().setRetryHandler(new DefaultHttpRequestRetryHandler(3, false)).build();
     }
     public void run() {
@@ -156,14 +177,58 @@ class Producer implements Runnable {
         JSONObject user = new JSONObject();
         JSONObject creds = new JSONObject();
         JSONObject profile = new JSONObject();
+        JSONObject password = new JSONObject();
 
         //Add username
         profile.put("login", csvRecord.get(csvLoginField));
-        //Flesh out rest of profile
-        for (String headerColumn:csvHeaders)
-            profile.put(configuration.getProperty("csvHeader."+headerColumn),csvRecord.get(headerColumn));
 
-        creds.put("password", new JSONObject("{\"value\": \""+RandomStringUtils.randomAlphabetic(8)+"\"}"));
+        // Add subectId
+        String subjectId = uuidGenerator.generate().toString().replaceAll("-", "");
+        profile.put("subjectId", subjectId);
+
+        //Flesh out rest of profile
+        for (String headerColumn:csvHeaders) {
+            if (headerColumn.equals("HASHALGORITHM") || headerColumn.equals("HASHVALUE")) {
+                continue;
+            }
+            profile.put(configuration.getProperty("csvHeader."+headerColumn),csvRecord.get(headerColumn));
+        }
+
+        if (credentialType.equals("random")) {
+            password.put("value", RandomStringUtils.randomAlphabetic(8));
+            creds.put("password", password);
+        } else if (credentialType.equals("hash")) {
+            JSONObject hash = new JSONObject();
+            String hashAlgorithmField = configuration.getProperty("hashAlgorithm");
+            String hashValueField = configuration.getProperty("hashValue");
+            String hashSaltField = configuration.getProperty("hashSalt");
+            String hashWorkFactorField = configuration.getProperty("hashWorkFactor");
+            String hashSaltOrderField = configuration.getProperty("hashSaltOrder"); 
+
+            String hashAlgorithm = csvRecord.get(hashAlgorithmField);
+            String hashValue = csvRecord.get(hashValueField);
+
+            hash.put("algorithm", hashAlgorithm);
+
+            if (hashAlgorithm.equals("BCRYPT")) {
+                hash.put("value", hashValue.substring(29));
+                hash.put("salt", hashValue.substring(7,29));
+                hash.put("workFactor", Integer.parseInt(hashValue.substring(4,6))); 
+            } else {
+                hash.put("value", csvRecord.get(hashValueField));
+                hash.put("salt", csvRecord.get(hashSaltField));
+                hash.put("saltOrder", csvRecord.get(hashSaltOrderField));
+            }
+
+            password.put("hash", hash);
+            creds.put("password", password);
+        } else if (credentialType.equals("hook")) {
+            JSONObject hook = new JSONObject();
+            hook.put("type", "default");
+
+            password.put("hook", hook);
+            creds.put("password", password);
+        }
 
         user.put("profile", profile);
         user.put("credentials", creds);
@@ -181,7 +246,13 @@ class Producer implements Runnable {
         try{
             httpResponse = httpclient.execute(request);
             int responseCode = httpResponse.getStatusLine().getStatusCode();
-            
+            String responseJsonString = EntityUtils.toString(httpResponse.getEntity());
+            JSONObject responseJsonObject = new JSONObject(responseJsonString);
+            JSONObject profileJsonObject = (JSONObject)responseJsonObject.get("profile");
+            String oktaSubjectId = profileJsonObject.getString("subjectId");
+            Map csvMap = csvRecord.toMap();
+
+
             //Rate limit exceeded, hold off processing for this thread till the limit is reset
             if (responseCode == 429){//Retry after appropriate time
                 handleErrorResponse(true, responseCode, httpResponse, csvRecord, null);
@@ -193,8 +264,19 @@ class Producer implements Runnable {
             else if (responseCode != 200){//Non-success
                 handleErrorResponse(false, responseCode, httpResponse, csvRecord, "");
             }
-            else
+            else {
+                csvMap.put("subjectId", oktaSubjectId);
+                csvMap.put("oktaId", responseJsonObject.getString("id"));
+
+                synchronized(successRecordPrinter) {
+                    for (String header: successHeaders)
+                        successRecordPrinter.print(csvMap.get(header));
+                    successRecordPrinter.println();
+                    successRecordPrinter.flush();
+                }
+
                 successCount.getAndIncrement();
+            }
             if (successCount.get()!=0 && successCount.get()%100==0)System.out.print(".");
         } catch(Exception e){//Issue with the connection. Let's not lose the consumer thread
             handleErrorResponse(false, 400, httpResponse, csvRecord, e.getLocalizedMessage());
