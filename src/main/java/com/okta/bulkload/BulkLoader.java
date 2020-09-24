@@ -246,12 +246,6 @@ class Producer implements Runnable {
         try{
             httpResponse = httpclient.execute(request);
             int responseCode = httpResponse.getStatusLine().getStatusCode();
-            String responseJsonString = EntityUtils.toString(httpResponse.getEntity());
-            JSONObject responseJsonObject = new JSONObject(responseJsonString);
-            JSONObject profileJsonObject = (JSONObject)responseJsonObject.get("profile");
-            String oktaSubjectId = profileJsonObject.getString("subjectId");
-            Map csvMap = csvRecord.toMap();
-
 
             //Rate limit exceeded, hold off processing for this thread till the limit is reset
             if (responseCode == 429){//Retry after appropriate time
@@ -265,17 +259,7 @@ class Producer implements Runnable {
                 handleErrorResponse(false, responseCode, httpResponse, csvRecord, "");
             }
             else {
-                csvMap.put("subjectId", oktaSubjectId);
-                csvMap.put("oktaId", responseJsonObject.getString("id"));
-
-                synchronized(successRecordPrinter) {
-                    for (String header: successHeaders)
-                        successRecordPrinter.print(csvMap.get(header));
-                    successRecordPrinter.println();
-                    successRecordPrinter.flush();
-                }
-
-                successCount.getAndIncrement();
+                handleSuccessResponse(httpResponse, csvRecord);
             }
             if (successCount.get()!=0 && successCount.get()%100==0)System.out.print(".");
         } catch(Exception e){//Issue with the connection. Let's not lose the consumer thread
@@ -318,5 +302,29 @@ class Producer implements Runnable {
             }
         }
         errorCount.getAndIncrement();
+    }
+
+    void handleSuccessResponse(CloseableHttpResponse httpResponse, CSVRecord csvRecord) throws IOException {
+        String responseJsonString = EntityUtils.toString(httpResponse.getEntity());
+        JSONObject responseJsonObject = new JSONObject(responseJsonString);
+        JSONObject profileJsonObject = (JSONObject)responseJsonObject.get("profile");
+        String oktaSubjectId = profileJsonObject.getString("subjectId");
+        Map csvMap = csvRecord.toMap();
+
+        if (profileJsonObject == null) {
+            handleErrorResponse(false, 200, httpResponse, csvRecord, "No profile object returned");
+        } else {
+            csvMap.put("subjectId", oktaSubjectId);
+            csvMap.put("oktaId", responseJsonObject.getString("id"));
+
+            synchronized(successRecordPrinter) {
+                for (String header: successHeaders)
+                    successRecordPrinter.print(csvMap.get(header));
+                    successRecordPrinter.println();
+                    successRecordPrinter.flush();
+            }
+
+            successCount.getAndIncrement();
+        }
     }
 }
