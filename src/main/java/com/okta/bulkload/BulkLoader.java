@@ -179,6 +179,15 @@ class Producer implements Runnable {
         JSONObject profile = new JSONObject();
         JSONObject password = new JSONObject();
 
+        //Get Group IDs
+        JSONArray groupIdsJson = null;
+        String groupIdString = configuration.getProperty("groupIds");
+
+        if (groupIdString != null) {
+            String[] groupIds = groupIdString.split(",");
+            groupIdsJson = new JSONArray(groupIds);
+        }
+
         //Add username
         profile.put("login", csvRecord.get(csvLoginField));
 
@@ -233,8 +242,15 @@ class Producer implements Runnable {
         user.put("profile", profile);
         user.put("credentials", creds);
 
+        if (groupIdsJson != null) {
+            user.put("groupIds", groupIdsJson);
+        }
+
+        System.out.println("User: " + user.toString());
+
         // Build JSON payload
         StringEntity data = new StringEntity(user.toString(),ContentType.APPLICATION_JSON);
+        System.out.println("Data: " + data);
 
         // build http request and assign payload data
         HttpUriRequest request = RequestBuilder
